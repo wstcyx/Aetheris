@@ -1,1 +1,1 @@
-{"schema_version":"1","event_uid":"evt-103","job_id":"job-abc123","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"not-a-valid-timestamp","type":"step_started","payload":{},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0"}
+{"schema_version":"1","event_uid":"evt-103","job_id":"job-abc123","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"2099-01-01T00:00:00Z","type":"step_started","payload":{},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0"}

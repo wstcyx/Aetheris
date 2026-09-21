@@ -114,8 +114,8 @@ SDK 侧（Python `sdk/durability-py/aetheris_durability/types.py` + Go `sdk/dura
 
 | 映射结果 | 数量 | 事件 |
 | --- | --- | --- |
-| 直接映射 | 8 | `job_created`, `job_completed`, `job_failed`, `job_cancelled`, `step_started`, `step_finished`, `step_failed`, `step_retried`, `checkpoint_saved` |
-| 需追加新 EventType | 4 | `job_started`, `step_skipped`, `effect_recorded`（+ `checkpoint_loaded` 追加但不允许上报） |
+| 直接映射 | 9 | `job_created`, `job_completed`, `job_failed`, `job_cancelled`, `step_started`, `step_finished`, `step_failed`, `step_retried`, `checkpoint_saved` |
+| 需追加新 EventType | 3 | `job_started`, `step_skipped`, `effect_recorded` |
 | 不上报 | 1 | `checkpoint_loaded`（SDK 本地行为，上报无意义） |
 
 ### 3.3 追加 EventType 的约束
@@ -204,14 +204,26 @@ SDK 侧（Python `sdk/durability-py/aetheris_durability/types.py` + Go `sdk/dura
 
 ## 8. 负向场景与拒绝码
 
-| 场景 | 拒绝码 | 客户端动作 |
-| --- | --- | --- |
-| 缺 `schema_version` | 200 + `accepted_version: "0"`（降级） | 记日志，继续上报 |
-| 未知 `type` | 200 + `rejections[].reason: "unknown_type"` | 检查 SDK 版本是否需升级 |
-| `occurred_at` 为未来时间（> 服务端时钟 + 5min） | 200 + `rejections[].reason: "future_timestamp"` | 校正时钟后重发该条 |
-| `payload` 超 256KB | 413 Payload Too Large | 拆分或截断 payload |
-| `job_id` 格式非法（不匹配 `^[a-zA-Z0-9_-]{1,128}$`） | 200 + `rejections[].reason: "invalid_job_id"` | 修正 job_id 格式 |
-| `tenant_id` 与鉴权 token 不一致 | 403 Forbidden | 检查鉴权配置 |
+> **注意**：以下拒绝码分为 schema 层和 runtime 层两级。schema 层（JSON Schema）只能校验格式和结构，无法校验语义（如"未来时间"或"payload 超长"）。标 **[runtime]** 的场景由 ingest endpoint（#4）在运行时执行，schema 不覆盖。
+
+| 场景 | 拒绝码 | 客户端动作 | 校验层 |
+| --- | --- | --- | --- |
+| 缺 `schema_version` | 200 + `accepted_version: "0"`（降级） | 记日志，继续上报 | [runtime] |
+| 未知 `type` | 200 + `rejections[].reason: "unknown_type"` | 检查 SDK 版本是否需升级 | schema + runtime |
+| `occurred_at` 为未来时间（> 服务端时钟 + 5min） | 200 + `rejections[].reason: "future_timestamp"` | 校正时钟后重发该条 | **[runtime]** — schema 仅校验 `format: date-time`（合法 RFC 3339 即通过），未来时间在 schema 层不可区分 |
+| `payload` 超 256KB | 413 Payload Too Large | 拆分或截断 payload | **[runtime]** — schema 无 `maxLength`，需 ingest endpoint 检查 Content-Length |
+| `job_id` 格式非法（不匹配 `^[a-zA-Z0-9_-]{1,128}$`） | 200 + `rejections[].reason: "invalid_job_id"` | 修正 job_id 格式 | schema (`pattern`) |
+| `tenant_id` 与鉴权 token 不一致 | 403 Forbidden | 检查鉴权配置 | [runtime] |
+
+### 8.1 Schema 校验时序
+
+ingest endpoint 必须按以下顺序处理：
+
+1. **先做版本检测**：检查 `schema_version` 字段。缺失 → 按 legacy (v0) 处理，跳过 v1 schema 校验。不匹配 → 返回 426。
+2. **再做 schema 校验**：仅对 `schema_version: "1"` 的事件用 v1 schema 校验。
+3. **最后做 runtime 语义校验**：未来时间、payload 超长、job 终态等需运行时判断的场景。
+
+这一时序确保旧 SDK 事件不会被 v1 schema 误拒。
 | Job 已终态（completed/failed/cancelled） | 200 + `rejections[].reason: "job_terminated"` | 停止向该 job 上报 |
 
 ## 9. JSON Schema
