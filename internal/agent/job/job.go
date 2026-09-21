@@ -108,6 +108,15 @@ type Job struct {
 	// PlannerVersion Planner 版本（可选）；记录生成 Plan 时的 Planner 版本
 	PlannerVersion string
 
+	// ParentJobID 父 Job ID（跨 agent 调用链，#9）：A 调 B 时 B 的 job 挂到 A 的 job 下
+	ParentJobID string
+	// RootJobID 根 Job ID（跨 agent 调用链，#9）：整条链恒定，根 job 的 ID
+	RootJobID string
+	// ParentAgentID 调用方 Agent ID（#9）
+	ParentAgentID string
+	// ParentSpanID 父 span ID（W3C traceparent 或 X-Aetheris 传递）
+	ParentSpanID string
+
 	// pendingEvent 待发出的领域事件（在状态转换时生成）
 	pendingEvent *jobstore.JobEvent
 }

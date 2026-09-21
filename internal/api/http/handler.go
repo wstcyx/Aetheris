@@ -1078,6 +1078,43 @@ func (h *Handler) AgentMessage(ctx context.Context, c *app.RequestContext) {
 	if h.jobStore != nil {
 		// 先创建 Job 得到稳定 jobID，再双写事件流，避免 Create failed时留下孤立事件；多租户写入 TenantID
 		j := &job.Job{AgentID: id, TenantID: tenantID, Goal: req.Message, Status: job.StatusPending, SessionID: agent.Session.ID, IdempotencyKey: idempotencyKey}
+
+		// #9: consume inbound call-chain headers to establish parent/root job
+		parentJobID := strings.TrimSpace(string(c.GetHeader("X-Aetheris-Job-ID")))
+		parentAgentID := strings.TrimSpace(string(c.GetHeader("X-Aetheris-Agent-ID")))
+		if parentJobID != "" {
+			// Verify parent job exists and belongs to the same tenant
+			// (cross-tenant chaining is disconnected by default, #9 INV)
+			parent, err := h.jobStore.Get(ctx, parentJobID)
+			if err == nil && parent != nil {
+				if parent.TenantID == tenantID {
+					// Same tenant: establish chain
+					j.ParentJobID = parentJobID
+					j.ParentAgentID = parentAgentID
+					if parent.RootJobID != "" {
+						j.RootJobID = parent.RootJobID
+					} else {
+						j.RootJobID = parentJobID // parent is root
+					}
+				} else {
+					// Cross-tenant: disconnect and log, don't leak
+					hlog.CtxInfof(ctx, "cross-tenant call chain disconnected: parent=%s tenant=%s", parentJobID, tenantID)
+				}
+			}
+			// If parent doesn't exist or error: don't establish chain
+			// (avoid side-channel probing, #9: don't reveal if job exists)
+		}
+
+		// Parse W3C traceparent for parent_span_id
+		traceparent := strings.TrimSpace(string(c.GetHeader("traceparent")))
+		if traceparent != "" {
+			// W3C format: version-trace_id-parent_span_id-flags
+			parts := strings.Split(traceparent, "-")
+			if len(parts) >= 4 {
+				j.ParentSpanID = parts[2]
+			}
+		}
+
 		jobIDOut, errCreate := h.jobStore.Create(ctx, j)
 		if errCreate != nil {
 			hlog.CtxErrorf(ctx, "创建 Job failed: %v", errCreate)
