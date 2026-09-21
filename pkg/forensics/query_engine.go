@@ -17,6 +17,7 @@ package forensics
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -75,13 +76,11 @@ func (e *QueryEngine) Query(ctx context.Context, req QueryRequest) (*QueryRespon
 	if limit <= 0 {
 		limit = 20
 	}
-	offset := req.Offset
-	if offset < 0 {
-		offset = 0
-	}
 
+	// #8: jobSource == nil is no longer silent. Return explicit error
+	// instead of empty results (dead code elimination).
 	if e.jobSource == nil {
-		return &QueryResponse{Jobs: []JobSummary{}, TotalCount: 0, Page: offset / limit}, nil
+		return nil, fmt.Errorf("forensics: jobSource not configured (use WithJobSource)")
 	}
 
 	jobs, err := e.jobSource.ListJobs(ctx, req)
@@ -142,19 +141,24 @@ func (e *QueryEngine) Query(ctx context.Context, req QueryRequest) (*QueryRespon
 		return filtered[i].CreatedAt.After(filtered[j].CreatedAt)
 	})
 
+	// #8: cursor pagination (replace offset)
 	total := len(filtered)
-	if offset > total {
-		offset = total
+	hasMore := total > limit
+	if hasMore {
+		filtered = filtered[:limit]
 	}
-	end := offset + limit
-	if end > total {
-		end = total
+	nextCursor := ""
+	if hasMore && len(filtered) > 0 {
+		last := filtered[len(filtered)-1]
+		nextCursor = last.CreatedAt.Format(time.RFC3339Nano) + ":" + last.JobID
 	}
 
 	return &QueryResponse{
-		Jobs:       filtered[offset:end],
+		Jobs:       filtered,
 		TotalCount: total,
-		Page:       offset / limit,
+		Page:       0, // deprecated
+		NextCursor:  nextCursor,
+		HasMore:    hasMore,
 	}, nil
 }
 

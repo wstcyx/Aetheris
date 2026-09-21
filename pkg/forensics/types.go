@@ -18,16 +18,17 @@ import (
 	"time"
 )
 
-// QueryRequest 取证查询请求（2.0-M3）
+// QueryRequest 取证查询请求（2.0-M3; #8: agent_filter optional, cursor pagination）
 type QueryRequest struct {
 	TenantID     string    `json:"tenant_id"`
 	TimeRange    TimeRange `json:"time_range"`
 	ToolFilter   []string  `json:"tool_filter"`  // ["stripe*", "github*"]
 	EventFilter  []string  `json:"event_filter"` // ["approve", "payment"]
-	AgentFilter  []string  `json:"agent_filter"`
+	AgentFilter  []string  `json:"agent_filter"` // optional (#8: no longer required)
 	StatusFilter []string  `json:"status_filter"`
 	Limit        int       `json:"limit"`
-	Offset       int       `json:"offset"`
+	Offset       int       `json:"offset"`      // deprecated, use cursor
+	Cursor       string    `json:"cursor"`      // #8: cursor pagination
 }
 
 // TimeRange 时间范围
@@ -40,7 +41,9 @@ type TimeRange struct {
 type QueryResponse struct {
 	Jobs       []JobSummary `json:"jobs"`
 	TotalCount int          `json:"total_count"`
-	Page       int          `json:"page"`
+	Page       int          `json:"page"`         // deprecated, kept for backward compat
+	NextCursor  string      `json:"next_cursor"`  // #8: cursor for next page
+	HasMore    bool         `json:"has_more"`      // #8: whether more results exist
 }
 
 // JobSummary Job 摘要（用于列表）
