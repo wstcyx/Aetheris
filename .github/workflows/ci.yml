@@ -162,9 +162,82 @@ jobs:
       - name: Run Postgres-backed tests
         run: go test -v ./internal/runtime/jobstore ./internal/agent/job
 
+  sdk-go:
+    name: SDK Go (durability)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/durability
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.1"
+          cache-dependency-path: sdk/durability/go.sum
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Check gofmt
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "The following files are not formatted with gofmt:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Run tests with race detector
+        run: go test -v -race -count=1 ./...
+
+      - name: Verify no main module dependency
+        run: |
+          if go mod graph | grep -q "Aetheris/v2"; then
+            echo "ERROR: SDK depends on main Aetheris module (violates zero-dep constraint)"
+            go mod graph | grep "Aetheris/v2"
+            exit 1
+          fi
+          echo "✓ SDK has no dependency on main Aetheris module"
+
+  sdk-python:
+    name: SDK Python (durability-py)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    defaults:
+      run:
+        working-directory: sdk/durability-py
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (flake8)
+        run: |
+          pip install flake8
+          flake8 aetheris_durability/ --max-line-length=120 --extend-ignore=E203,W503 || true
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   coverage-report:
     name: Coverage Report
-    needs: [actionlint, build-and-test, lint, postgres-integration]
+    needs: [actionlint, build-and-test, lint, postgres-integration, sdk-go, sdk-python]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
