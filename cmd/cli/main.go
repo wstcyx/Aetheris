@@ -154,6 +154,12 @@ func main() {
 		}
 	case "sign":
 		runSign(args)
+	case "verify-tier":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "Usage: aetheris verify-tier <job_id>\n")
+			os.Exit(1)
+		}
+		runVerifyTier(args[0])
 	case "export":
 		if len(args) < 1 {
 			fmt.Fprintf(os.Stderr, "Usage: aetheris export <job_id> [--output evidence.zip]\n")
