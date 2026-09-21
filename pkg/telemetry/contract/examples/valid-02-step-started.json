@@ -1,0 +1,1 @@
+{"schema_version":"1","event_uid":"evt-002","job_id":"job-abc123","step_id":"step-fetch","span_id":"span-001","parent_span_id":"span-000","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"2026-09-21T12:34:57Z","type":"step_started","payload":{},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0"}

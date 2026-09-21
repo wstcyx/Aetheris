@@ -1,0 +1,1 @@
+{"schema_version":"1","event_uid":"evt-104","job_id":"job with spaces!","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"2026-09-21T12:34:56Z","type":"step_started","payload":{},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0"}

@@ -1,0 +1,1 @@
+{"schema_version":"1","event_uid":"evt-004","job_id":"job-abc123","step_id":"step-fetch","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"2026-09-21T12:35:03Z","type":"checkpoint_saved","payload":{"version":3},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0","idempotency_key":"exec-key-001"}

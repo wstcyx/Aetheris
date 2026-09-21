@@ -115,6 +115,18 @@ const (
 	// Experimental: RoutingAdvisor capability selection evidence (see design/routing-advisor-contract)
 	// RouteDecisionRecorded is replay-relevant: replay must read the recorded decision and bypass the advisor.
 	RouteDecisionRecorded EventType = "route_decision_recorded"
+
+	// T1 SDK reporting events (Issue #3 ingest-contract-v1):
+	// These EventType constants are appended for T1 SDK-upreported events.
+	// They do NOT participate in runtime replay (D7 decision: T1 events are
+	// read-only trace/query data, not replay-rebuild material).
+	// Existing constants' values are unchanged; these are additive only.
+	JobStarted      EventType = "job_started"       // T1: SDK agent 开始执行（区别于 runtime 的 job_running）
+	StepSkipped     EventType = "step_skipped"      // T1: SDK step 被跳过（条件跳过/已完成）
+	EffectRecorded  EventType = "effect_recorded"   // T1: SDK 函数副作用记录（区别于 runtime 的 command_committed/tool_invocation_finished）
+	// NOTE: checkpoint_loaded is intentionally NOT added here — it is a
+	// SDK-local event (loading from local store) and not reportable per
+	// ingest-contract-v1 §3.1.
 )
 
 // JobWaitingPayload job_waiting 事件 payload 契约；只有携带相同 correlation_key 的 signal 才能解除该 block（design/runtime-contract.md）

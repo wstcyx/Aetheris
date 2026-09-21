@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Colin4k1024/Aetheris/pkg/telemetry/contract/event-v1.schema.json",
+  "title": "Aetheris Ingest Event v1",
+  "description": "Wire contract for T1 SDK event reporting (Issue #3)",
+  "type": "object",
+  "required": ["schema_version", "event_uid", "job_id", "agent_id", "tenant_id", "occurred_at", "type", "sdk_name", "sdk_version"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Contract version. Missing field = legacy (version 0)."
+    },
+    "event_uid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Client-generated unique event ID for dedup (tenant, job_id, event_uid)."
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9_-]{1,128}$",
+      "description": "Job identifier."
+    },
+    "step_id": {
+      "type": ["string", "null"],
+      "maxLength": 128
+    },
+    "span_id": {
+      "type": ["string", "null"],
+      "maxLength": 128
+    },
+    "parent_span_id": {
+      "type": ["string", "null"],
+      "maxLength": 128
+    },
+    "root_span_id": {
+      "type": ["string", "null"],
+      "maxLength": 128
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "idempotency_key": {
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Agent-local clock time, RFC 3339. Server records its own recorded_at."
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "job_created",
+        "job_started",
+        "job_completed",
+        "job_failed",
+        "job_cancelled",
+        "step_started",
+        "step_finished",
+        "step_failed",
+        "step_retried",
+        "step_skipped",
+        "checkpoint_saved",
+        "effect_recorded"
+      ],
+      "description": "Event type. checkpoint_loaded is NOT reportable (SDK-local only)."
+    },
+    "payload": {
+      "type": ["object", "null"],
+      "description": "Event-specific payload. Max 256KB per event."
+    },
+    "sdk_name": {
+      "type": "string",
+      "enum": ["aetheris-durability-py", "aetheris-durability-go"],
+      "description": "SDK identifier."
+    },
+    "sdk_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+.*$",
+      "description": "SDK version (semver)."
+    }
+  }
+}

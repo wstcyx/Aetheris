@@ -1,0 +1,1 @@
+{"schema_version":"1","event_uid":"evt-006","job_id":"job-def456","step_id":"step-transform","span_id":"span-010","agent_id":"etl-agent","tenant_id":"tenant-acme","occurred_at":"2026-09-21T12:40:00Z","type":"step_failed","payload":{"error":"connection timeout","error_type":"TimeoutError"},"sdk_name":"aetheris-durability-go","sdk_version":"0.1.0"}
