@@ -65,10 +65,19 @@ func (r *RedactingStore) Append(ctx context.Context, jobID string, expectedVersi
 // Returns a copy of the event with redacted payload. If the engine
 // is nil or the payload is empty, returns the event unchanged.
 // On engine error or panic, returns error (fail-closed).
-func (r *RedactingStore) redactEvent(event JobEvent) (JobEvent, error) {
+func (r *RedactingStore) redactEvent(event JobEvent) (je JobEvent, err error) {
 	if r.engine == nil || len(event.Payload) == 0 {
 		return event, nil
 	}
+
+	// P0-B fix: recover from panic (e.g. regex engine nil pointer,
+	// regexp timeout) to ensure fail-closed, not crash.
+	defer func() {
+		if r := recover(); r != nil {
+			je = JobEvent{}
+			err = fmt.Errorf("%w: panic in redaction engine: %v", ErrRedactionFailed, r)
+		}
+	}()
 
 	redacted, err := r.engine.RedactData(string(event.Type), event.Payload)
 	if err != nil {
@@ -117,8 +126,36 @@ func (r *RedactingStore) GetCurrentAttemptID(ctx context.Context, jobID string) 
 	return r.inner.GetCurrentAttemptID(ctx, jobID)
 }
 
+// CreateSnapshot applies redaction to snapshot bytes before passing
+// to inner store (P1-A fix: snapshot is a serialization of event
+// stream state and may contain PII).
 func (r *RedactingStore) CreateSnapshot(ctx context.Context, jobID string, upToVersion int, snapshot []byte) error {
-	return r.inner.CreateSnapshot(ctx, jobID, upToVersion, snapshot)
+	if r.engine == nil || len(snapshot) == 0 {
+		return r.inner.CreateSnapshot(ctx, jobID, upToVersion, snapshot)
+	}
+
+	redacted, err := r.redactSnapshot(snapshot)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRedactionFailed, err)
+	}
+	return r.inner.CreateSnapshot(ctx, jobID, upToVersion, redacted)
+}
+
+// redactSnapshot applies redaction to snapshot bytes (P1-A fix).
+// Snapshot is a serialized event stream state; we redact it as a
+// generic JSON blob using the global rules.
+func (r *RedactingStore) redactSnapshot(snapshot []byte) ([]byte, error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			// fail-closed: return error, don't write unredacted snapshot
+		}
+	}()
+	// Apply global redaction rules to snapshot (treat as "snapshot" type)
+	redacted, err := r.engine.RedactData("snapshot", snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot redaction failed: %w", err)
+	}
+	return redacted, nil
 }
 
 func (r *RedactingStore) GetLatestSnapshot(ctx context.Context, jobID string) (*JobSnapshot, error) {

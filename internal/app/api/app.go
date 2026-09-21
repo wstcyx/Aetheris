@@ -64,6 +64,7 @@ import (
 	"github.com/Colin4k1024/Aetheris/v2/internal/runtime/session"
 	"github.com/Colin4k1024/Aetheris/v2/internal/splitter"
 	"github.com/Colin4k1024/Aetheris/v2/internal/storage/vector"
+	"github.com/Colin4k1024/Aetheris/v2/pkg/redaction"
 	"github.com/Colin4k1024/Aetheris/v2/pkg/auth"
 	"github.com/Colin4k1024/Aetheris/v2/pkg/config"
 )
@@ -443,6 +444,13 @@ func NewApp(bootstrap *app.Bootstrap) (*App, error) {
 		jobStore = job.NewJobStoreMem()
 		jobEventStore = jobstore.NewMemoryStore()
 	}
+
+	// #5: wrap jobEventStore with RedactingStore to ensure all write
+	// paths go through the redaction pipeline (fail-closed on PII).
+	// Uses DefaultRedactionPolicy; can be overridden via config later.
+	redactionEngine := redaction.NewEngine(jobstore.DefaultRedactionPolicy(), nil)
+	jobEventStore = jobstore.NewRedactingStore(jobEventStore, redactionEngine)
+
 	var invocationStore agentexec.ToolInvocationStore
 	if bootstrap.Config != nil && bootstrap.Config.JobStore.Type == "postgres" && bootstrap.Config.JobStore.DSN != "" {
 		invPoolConfig, errPool := pgxpool.ParseConfig(bootstrap.Config.JobStore.DSN)

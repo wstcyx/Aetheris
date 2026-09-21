@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -319,6 +320,65 @@ func TestRedactingStore_DecisionSnapshotRedacted(t *testing.T) {
 			}
 			if !strings.HasPrefix(p["reasoning"], "hash:") {
 				t.Errorf("expected reasoning hashed, got %q", p["reasoning"])
+			}
+		}
+	}
+}
+
+// TestRedactingStore_Concurrent50 verifies 50 concurrent Append
+// operations are race-free (#5: -race 下 50 并发无竞态).
+func TestRedactingStore_Concurrent50(t *testing.T) {
+	inner := NewMemoryStore()
+	policy := DefaultRedactionPolicy()
+	engine := redaction.NewEngine(policy, nil)
+	store := NewRedactingStore(inner, engine)
+
+	ctx := context.Background()
+
+	// Create initial jobs
+	for i := 0; i < 50; i++ {
+		jobID := "job-conc-" + string(rune('a'+i))
+		_, _ = store.Append(ctx, jobID, 0, JobEvent{
+			JobID: jobID, Type: JobCreated, Payload: []byte(`{}`), CreatedAt: time.Now(),
+		})
+	}
+
+	// 50 goroutines each appending to their own job
+	var wg sync.WaitGroup
+	errCh := make(chan error, 50)
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			jobID := "job-conc-" + string(rune('a'+n))
+			payload, _ := json.Marshal(map[string]string{
+				"input":  "user@example.com",
+				"output": "result-" + string(rune('a'+n)),
+			})
+			_, err := store.Append(ctx, jobID, 1, JobEvent{
+				JobID: jobID, Type: StepStarted, Payload: payload, CreatedAt: time.Now(),
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Errorf("concurrent Append failed: %v", err)
+		}
+	}
+
+	// Verify PII redacted in all jobs
+	for i := 0; i < 50; i++ {
+		jobID := "job-conc-" + string(rune('a'+i))
+		events, _, _ := inner.ListEvents(ctx, jobID)
+		for _, ev := range events {
+			if strings.Contains(string(ev.Payload), "user@example.com") {
+				t.Errorf("PII leaked in job %s event %s", jobID, ev.Type)
 			}
 		}
 	}
