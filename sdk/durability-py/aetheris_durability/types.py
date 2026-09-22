@@ -48,6 +48,8 @@ class Event:
     job_id: str = ""
     type: EventType = EventType.JOB_CREATED
     step_id: str = ""
+    span_id: str = ""
+    parent_span_id: str = ""
     payload: Optional[Dict[str, Any]] = None
     version: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

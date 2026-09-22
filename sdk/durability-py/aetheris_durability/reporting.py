@@ -17,7 +17,7 @@ Quick start (≤ 10 lines, 0 business logic changes):
     import aetheris_durability as ae
     reporter = ae.Reporter.from_env()
 
-    @ae.step("fetch_data")
+    @reporter.step("fetch_data")
     def fetch_data(state):
         return {"data": call_api()}
 """
@@ -167,21 +167,24 @@ class Reporter:
             batch = self._buffer[:]
             self._buffer.clear()
 
-        envelopes = [self._to_envelope(ev) for ev in batch]
-        body = json.dumps({"events": envelopes}).encode("utf-8")
-
-        req = urlreq.Request(
-            f"{self._endpoint}/api/telemetry/v1/events",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Tenant-ID": self._tenant_id,
-                "Authorization": f"Bearer {self._token}",
-            },
-            method="POST",
-        )
-
+        # P0-A fix: entire flush (including serialization) wrapped in
+        # try/except to guarantee fail-open invariant — no exception
+        # from _to_envelope or json.dumps can propagate to business code.
         try:
+            envelopes = [self._to_envelope(ev) for ev in batch]
+            body = json.dumps({"events": envelopes}).encode("utf-8")
+
+            req = urlreq.Request(
+                f"{self._endpoint}/api/telemetry/v1/events",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Tenant-ID": self._tenant_id,
+                    "Authorization": f"Bearer {self._token}",
+                },
+                method="POST",
+            )
+
             resp = urlreq.urlopen(req, timeout=self._timeout)
             if resp.status == 200:
                 self._success_count += len(batch)
@@ -194,10 +197,12 @@ class Reporter:
         except Exception as e:
             self._failed_count += len(batch)
             logger.warning("reporting failed (unexpected): %s", e)
+            self._failed_count += len(batch)
+            logger.warning("reporting failed (unexpected): %s", e)
 
     def _to_envelope(self, ev: Event) -> Dict[str, Any]:
         """Convert SDK Event to ingest-contract-v1 envelope."""
-        return {
+        envelope = {
             "schema_version": _SCHEMA_VERSION,
             "event_uid": ev.id or f"evt-{uuid.uuid4()}",
             "job_id": ev.job_id,
@@ -212,6 +217,12 @@ class Reporter:
             "sdk_name": self._sdk_name,
             "sdk_version": self._sdk_version,
         }
+        # P0-B fix: include span_id/parent_span_id when set
+        if ev.span_id:
+            envelope["span_id"] = ev.span_id
+        if ev.parent_span_id:
+            envelope["parent_span_id"] = ev.parent_span_id
+        return envelope
 
     def step(self, step_id: str) -> Callable[[Callable[..., T]], Callable[..., T]]:
         """Decorator that wraps a function with step-level event reporting.
@@ -229,6 +240,8 @@ class Reporter:
             @functools.wraps(fn)
             def wrapper(*args: Any, **kwargs: Any) -> T:
                 job_id = kwargs.get("job_id", "")
+                # P0-B fix: generate span_id and pass it to all events
+                # for this step, ensuring span_id is in the envelope
                 span_id = f"span-{str(uuid.uuid4())[:8]}"
 
                 # Report step_started
@@ -236,6 +249,7 @@ class Reporter:
                     type=EventType.STEP_STARTED,
                     job_id=job_id,
                     step_id=step_id,
+                    span_id=span_id,
                     payload={},
                 ))
 
@@ -246,6 +260,7 @@ class Reporter:
                         type=EventType.STEP_FINISHED,
                         job_id=job_id,
                         step_id=step_id,
+                        span_id=span_id,
                         payload={"status": "success"},
                     ))
                     return result
@@ -255,6 +270,7 @@ class Reporter:
                         type=EventType.STEP_FAILED,
                         job_id=job_id,
                         step_id=step_id,
+                        span_id=span_id,
                         payload={
                             "error": type(e).__name__,
                             "message": str(e)[:200],  # truncated
