@@ -81,13 +81,8 @@ func (h *Handler) ForensicsQuery(c context.Context, ctx *app.RequestContext) {
 		tenantID = "default"
 	}
 
-	if len(req.AgentFilter) == 0 {
-		ctx.JSON(consts.StatusBadRequest, map[string]string{
-			"error": "agent_filter is required in current implementation",
-		})
-		return
-	}
-
+	// #8: agent_filter is NO LONGER required. Query by tenant + optional
+	// time range + optional agent filter via ListByTenant (filter pushdown).
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 20
@@ -95,9 +90,23 @@ func (h *Handler) ForensicsQuery(c context.Context, ctx *app.RequestContext) {
 	if limit > 200 {
 		limit = 200
 	}
-	offset := req.Offset
-	if offset < 0 {
-		offset = 0
+
+	// Cursor pagination (stable across concurrent writes, #8)
+	// Cursor is the last job's CreatedAt (RFC3339) + ":" + job ID.
+	// Empty cursor = first page. Cursor is consumed by setting it as
+	// timeRange.End upper bound (jobs before the cursor position).
+	cursor := strings.TrimSpace(req.Cursor)
+	if cursor != "" {
+		// Parse cursor: "RFC3339Nano:jobID"
+		parts := strings.SplitN(cursor, ":", 2)
+		if len(parts) == 2 {
+			if cursorTime, err := time.Parse(time.RFC3339Nano, parts[0]); err == nil {
+				// Set timeRange.End to cursor time to get jobs before cursor
+				if req.TimeRange.End.IsZero() || req.TimeRange.End.After(cursorTime) {
+					req.TimeRange.End = cursorTime
+				}
+			}
+		}
 	}
 
 	statusFilter := make(map[string]struct{}, len(req.StatusFilter))
@@ -105,30 +114,37 @@ func (h *Handler) ForensicsQuery(c context.Context, ctx *app.RequestContext) {
 		statusFilter[strings.ToLower(strings.TrimSpace(s))] = struct{}{}
 	}
 
-	jobMap := make(map[string]*job.Job)
-	for _, agentID := range req.AgentFilter {
-		jobs, err := h.jobStore.ListByAgent(c, strings.TrimSpace(agentID), tenantID)
-		if err != nil {
-			ctx.JSON(consts.StatusInternalServerError, map[string]string{
-				"error": fmt.Sprintf("list jobs failed for agent %s: %v", agentID, err),
-			})
-			return
-		}
-		for _, j := range jobs {
-			if j != nil {
-				jobMap[j.ID] = j
-			}
+	// Normalize agent filter
+	var agentIDs []string
+	for _, a := range req.AgentFilter {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			agentIDs = append(agentIDs, a)
 		}
 	}
 
-	summaries := make([]forensics.JobSummary, 0, len(jobMap))
-	for _, j := range jobMap {
-		if !req.TimeRange.Start.IsZero() && j.CreatedAt.Before(req.TimeRange.Start) {
-			continue
-		}
-		if !req.TimeRange.End.IsZero() && j.CreatedAt.After(req.TimeRange.End) {
-			continue
-		}
+	// Convert forensics.TimeRange to job.TimeRange
+	jobTimeRange := job.TimeRange{
+		Start: req.TimeRange.Start,
+		End:   req.TimeRange.End,
+	}
+
+	// #8: filter pushdown — query with tenant + agent + time range in one call
+	jobs, err := h.jobStore.ListByTenant(c, tenantID, agentIDs, jobTimeRange, limit+1)
+	if err != nil {
+		ctx.JSON(consts.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("list jobs failed: %v", err),
+		})
+		return
+	}
+
+	hasMore := len(jobs) > limit
+	if hasMore {
+		jobs = jobs[:limit]
+	}
+
+	summaries := make([]forensics.JobSummary, 0, len(jobs))
+	for _, j := range jobs {
 		if len(statusFilter) > 0 {
 			if _, ok := statusFilter[strings.ToLower(j.Status.String())]; !ok {
 				continue
@@ -168,19 +184,19 @@ func (h *Handler) ForensicsQuery(c context.Context, ctx *app.RequestContext) {
 		return summaries[i].CreatedAt.After(summaries[j].CreatedAt)
 	})
 
-	total := len(summaries)
-	if offset > total {
-		offset = total
-	}
-	end := offset + limit
-	if end > total {
-		end = total
+	// Compute next cursor from the last result
+	nextCursor := ""
+	if hasMore && len(summaries) > 0 {
+		last := summaries[len(summaries)-1]
+		nextCursor = last.CreatedAt.Format(time.RFC3339Nano) + ":" + last.JobID
 	}
 
 	ctx.JSON(consts.StatusOK, forensics.QueryResponse{
-		Jobs:       summaries[offset:end],
-		TotalCount: total,
-		Page:       offset / limit,
+		Jobs:       summaries,
+		TotalCount: len(summaries),
+		Page:       0, // deprecated, kept for backward compat
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
 	})
 }
 

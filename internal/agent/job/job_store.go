@@ -22,6 +22,12 @@ import (
 	"github.com/google/uuid"
 )
 
+// TimeRange 时间范围（用于 ListByTenant 查询过滤）
+type TimeRange struct {
+	Start time.Time
+	End   time.Time
+}
+
 // JobStore 任务存储：创建、查询、更新状态、拉取 Pending、更新恢复游标；多租户时 tenantID 过滤
 type JobStore interface {
 	Create(ctx context.Context, job *Job) (string, error)
@@ -32,6 +38,9 @@ type JobStore interface {
 	GetByAgentTenantAndIdempotencyKey(ctx context.Context, agentID, tenantID, idempotencyKey string) (*Job, error)
 	// ListByAgent 按 Agent 列出 Job；tenantID 非空时仅返回该租户下的 Job
 	ListByAgent(ctx context.Context, agentID string, tenantID string) ([]*Job, error)
+	// ListByTenant 按租户列出 Job，可选时间范围和 agent 过滤（#8: 去掉 agent_filter 强制）
+	// agentIDs 为空时返回该租户下所有 Job；timeRange.Start/End 为零值时不限
+	ListByTenant(ctx context.Context, tenantID string, agentIDs []string, timeRange TimeRange, limit int) ([]*Job, error)
 	UpdateStatus(ctx context.Context, jobID string, status JobStatus) error
 	// UpdateCursor 更新 Job 的恢复游标（Checkpoint ID），用于恢复时从 LastCheckpoint 继续
 	UpdateCursor(ctx context.Context, jobID string, cursor string) error
@@ -193,6 +202,45 @@ func (s *JobStoreMem) ListByAgent(ctx context.Context, agentID string, tenantID 
 		}
 		cp := *j
 		list = append(list, &cp)
+	}
+	return list, nil
+}
+
+// ListByTenant 按租户列出 Job，可选 agent 过滤和时间范围（#8）
+func (s *JobStoreMem) ListByTenant(ctx context.Context, tenantID string, agentIDs []string, timeRange TimeRange, limit int) ([]*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Build agent filter set
+	agentSet := make(map[string]struct{}, len(agentIDs))
+	for _, a := range agentIDs {
+		agentSet[a] = struct{}{}
+	}
+
+	var list []*Job
+	for _, j := range s.byID {
+		// Tenant isolation: never return other tenants' jobs
+		if tenantID != "" && j.TenantID != tenantID {
+			continue
+		}
+		// Agent filter (optional)
+		if len(agentSet) > 0 {
+			if _, ok := agentSet[j.AgentID]; !ok {
+				continue
+			}
+		}
+		// Time range filter (optional)
+		if !timeRange.Start.IsZero() && j.CreatedAt.Before(timeRange.Start) {
+			continue
+		}
+		if !timeRange.End.IsZero() && j.CreatedAt.After(timeRange.End) {
+			continue
+		}
+		cp := *j
+		list = append(list, &cp)
+		if limit > 0 && len(list) >= limit {
+			break
+		}
 	}
 	return list, nil
 }

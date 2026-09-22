@@ -17,6 +17,7 @@ package job
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -351,6 +352,96 @@ func (s *JobStorePg) ListByAgent(ctx context.Context, agentID string, tenantID s
 		}
 		if idempotencyKey != nil {
 			j.IdempotencyKey = *idempotencyKey
+		}
+		j.RetryCount = retryCount
+		j.CreatedAt = createdAt
+		j.UpdatedAt = updatedAt
+		j.RequiredCapabilities = pgToCaps(requiredCaps)
+		list = append(list, &j)
+	}
+	return list, rows.Err()
+}
+
+// ListByTenant 按租户+可选 agent+可选时间范围查询 Job（#8: 过滤下推到 SQL）
+func (s *JobStorePg) ListByTenant(ctx context.Context, tenantID string, agentIDs []string, timeRange TimeRange, limit int) ([]*Job, error) {
+	query := `SELECT id, agent_id, COALESCE(tenant_id, 'default'), goal, status, cursor, retry_count, session_id, cancel_requested_at, created_at, updated_at, idempotency_key, required_capabilities FROM jobs WHERE 1=1`
+	args := []interface{}{}
+	argIdx := 1
+
+	// Tenant filter (mandatory for isolation)
+	if tenantID != "" {
+		query += fmt.Sprintf(` AND (tenant_id = $%d OR (tenant_id IS NULL AND $%d = 'default'))`, argIdx, argIdx)
+		args = append(args, tenantID)
+		argIdx++
+	}
+
+	// Agent filter (optional, IN clause)
+	if len(agentIDs) > 0 {
+		placeholders := make([]string, len(agentIDs))
+		for i, a := range agentIDs {
+			placeholders[i] = fmt.Sprintf("$%d", argIdx)
+			args = append(args, a)
+			argIdx++
+		}
+		query += fmt.Sprintf(` AND agent_id IN (%s)`, strings.Join(placeholders, ","))
+	}
+
+	// Time range filter (optional)
+	if !timeRange.Start.IsZero() {
+		query += fmt.Sprintf(` AND created_at >= $%d`, argIdx)
+		args = append(args, timeRange.Start)
+		argIdx++
+	}
+	if !timeRange.End.IsZero() {
+		query += fmt.Sprintf(` AND created_at <= $%d`, argIdx)
+		args = append(args, timeRange.End)
+		argIdx++
+	}
+
+	// ORDER BY must come before LIMIT (P0-A fix: was reversed, PG syntax error)
+	query += ` ORDER BY created_at DESC`
+
+	// Limit (cursor pagination support)
+	if limit > 0 {
+		query += fmt.Sprintf(` LIMIT $%d`, argIdx)
+		args = append(args, limit)
+		argIdx++
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []*Job
+	for rows.Next() {
+		var j Job
+		var status int
+		var cursor, sessionID, idempotencyKey, requiredCaps, tid *string
+		var retryCount int
+		var cancelRequestedAt *time.Time
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&j.ID, &j.AgentID, &tid, &j.Goal, &status, &cursor, &retryCount, &sessionID, &cancelRequestedAt, &createdAt, &updatedAt, &idempotencyKey, &requiredCaps); err != nil {
+			return nil, err
+		}
+		if tid != nil {
+			j.TenantID = *tid
+		} else {
+			j.TenantID = "default"
+		}
+		j.Status = pgToStatus(status)
+		if cursor != nil {
+			j.Cursor = *cursor
+		}
+		if sessionID != nil {
+			j.SessionID = *sessionID
+		}
+		if idempotencyKey != nil {
+			j.IdempotencyKey = *idempotencyKey
+		}
+		if cancelRequestedAt != nil {
+			j.CancelRequestedAt = *cancelRequestedAt
 		}
 		j.RetryCount = retryCount
 		j.CreatedAt = createdAt
