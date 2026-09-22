@@ -129,13 +129,16 @@ func (r *Reporter) Flush() {
 	if !r.Enabled() {
 		return
 	}
-	// Circuit breaker check
+	// Circuit breaker check (P1 fix: under lock)
+	r.mu.Lock()
 	if r.circuitOpen {
 		if time.Since(r.circuitAt) < circuitCooldown {
+			r.mu.Unlock()
 			return
 		}
 		r.circuitOpen = false
 	}
+	r.mu.Unlock()
 
 	r.mu.Lock()
 	if len(r.buffer) == 0 {
@@ -162,8 +165,9 @@ func (r *Reporter) Report(jobID, eventType string, payload map[string]any) {
 	}
 	r.buffer = append(r.buffer, envelope)
 	r.mu.Unlock()
-	// Flush immediately; #7 batching can be added later
-	r.Flush()
+	// P1 fix: don't flush synchronously — caller's business thread
+	// should not be blocked by network I/O. Flush is called by the
+	// user via defer r.Flush() or by a background goroutine.
 }
 
 // Step wraps a function with step-level event reporting.
@@ -232,10 +236,13 @@ func (r *Reporter) sendBatch(batch []EventEnvelope) {
 	}
 
 	var lastErr error
+	client := &http.Client{Timeout: r.timeout} // P1 fix: timeout now enforced
 	for attempt := 0; attempt < r.maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(context.Background(), "POST",
+		ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+		req, err := http.NewRequestWithContext(ctx, "POST",
 			r.endpoint+"/api/telemetry/v1/events", bytes.NewReader(body))
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
@@ -243,7 +250,8 @@ func (r *Reporter) sendBatch(batch []EventEnvelope) {
 		req.Header.Set("X-Tenant-ID", r.tenantID)
 		req.Header.Set("Authorization", "Bearer "+r.token)
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
+		cancel() // P1 fix: cancel context after request completes
 		if err != nil {
 			lastErr = err
 			r.backoffSleep(attempt)
@@ -255,7 +263,9 @@ func (r *Reporter) sendBatch(batch []EventEnvelope) {
 		switch {
 		case resp.StatusCode == 200:
 			atomic.AddInt64(&r.success, int64(len(batch)))
+			r.mu.Lock()
 			r.circuitOpen = false
+			r.mu.Unlock()
 			return
 		case resp.StatusCode == 429:
 			retryAfter := 5
@@ -265,10 +275,11 @@ func (r *Reporter) sendBatch(batch []EventEnvelope) {
 				}
 			}
 			atomic.AddInt64(&r.failed, int64(len(batch)))
+			r.mu.Lock()
 			r.circuitOpen = true
 			r.circuitAt = time.Now()
+			r.mu.Unlock()
 			log.Printf("reporting: 429, backing off %ds", retryAfter)
-			time.Sleep(time.Duration(retryAfter) * time.Second)
 			return
 		case resp.StatusCode >= 500:
 			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
@@ -280,8 +291,10 @@ func (r *Reporter) sendBatch(batch []EventEnvelope) {
 	}
 
 	atomic.AddInt64(&r.failed, int64(len(batch)))
+	r.mu.Lock()
 	r.circuitOpen = true
 	r.circuitAt = time.Now()
+	r.mu.Unlock()
 	if lastErr != nil {
 		log.Printf("reporting: failed after %d retries: %v", r.maxRetries, lastErr)
 	}
@@ -299,7 +312,7 @@ func (r *Reporter) toEnvelope(jobID, eventType string, payload map[string]any) E
 	payloadBytes, _ := json.Marshal(payload)
 	return EventEnvelope{
 		SchemaVersion: schemaVersion,
-		EventUID:      fmt.Sprintf("evt-%d", time.Now().UnixNano()),
+		EventUID:      fmt.Sprintf("evt-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&r.dropped, 0)),
 		JobID:         jobID,
 		AgentID:       r.agentID,
 		TenantID:      r.tenantID,
