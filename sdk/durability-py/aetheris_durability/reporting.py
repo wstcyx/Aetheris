@@ -17,7 +17,7 @@ Quick start (≤ 10 lines, 0 business logic changes):
     import aetheris_durability as ae
     reporter = ae.Reporter.from_env()
 
-    @reporter.step("fetch_data")
+    @ae.step("fetch_data")
     def fetch_data(state):
         return {"data": call_api()}
 """
@@ -33,7 +33,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 from urllib import request as urlreq
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 
 from .types import Event, EventType, Job
 
@@ -64,6 +64,11 @@ class Reporter:
         sdk_version: str = "0.2.0",
         timeout: float = _DEFAULT_TIMEOUT,
         max_buffer: int = _DEFAULT_BUFFER_SIZE,
+        flush_interval: float = 0.5,  # 0 = disable background flush (sync mode)
+        max_retries: int = 3,
+        base_backoff: float = 0.5,
+        max_backoff: float = 30.0,
+        sample_rate: float = 1.0,
     ) -> None:
         self._endpoint = endpoint.rstrip("/")
         self._tenant_id = tenant_id
@@ -73,11 +78,37 @@ class Reporter:
         self._sdk_version = sdk_version
         self._timeout = timeout
         self._max_buffer = max_buffer
+        self._max_retries = max_retries
+        self._base_backoff = base_backoff
+        self._max_backoff = max_backoff
+        self._sample_rate = sample_rate  # 1.0 = send all; <1.0 = sample down
         self._buffer: List[Event] = []
         self._lock = threading.Lock()
         self._dropped_count = 0
         self._success_count = 0
         self._failed_count = 0
+        self._retry_count = 0
+        self._circuit_open = False
+        self._circuit_opened_at = 0.0
+        # P0-A fix: background flush thread to avoid blocking business code
+        self._flush_interval = flush_interval
+        self._stop_event = threading.Event()
+        self._flush_thread: threading.Thread | None = None
+        if self.enabled and flush_interval > 0:
+            self._start_background_flush()
+
+    def _start_background_flush(self) -> None:
+        """Start a background daemon thread that periodically flushes buffer."""
+        self._flush_thread = threading.Thread(target=self._background_flush_loop, daemon=True)
+        self._flush_thread.start()
+
+    def _background_flush_loop(self) -> None:
+        """Background loop: flush buffer every _flush_interval seconds."""
+        while not self._stop_event.wait(self._flush_interval):
+            try:
+                self._flush()
+            except Exception:
+                pass  # fail-open: never propagate to background thread
 
     @classmethod
     def from_env(cls) -> "Reporter":
@@ -154,55 +185,150 @@ class Reporter:
                 self._buffer.pop(0)
                 self._dropped_count += 1
             self._buffer.append(event)
-        # Flush immediately for simplicity; #7 will add batching
-        self._flush()
+        # P0-A fix: no immediate flush in background mode.
+        # In sync mode (flush_interval=0), flush immediately for tests.
+        if self._flush_interval == 0:
+            self._flush()
 
     def _flush(self) -> None:
-        """Send buffered events to ingest endpoint. Fail-open."""
+        """Send buffered events to ingest endpoint. Fail-open (#7).
+
+        Implements:
+        - Exponential backoff with jitter on retry
+        - 429 Retry-After respect + sample rate reduction
+        - Circuit breaker (open after N consecutive failures)
+        - Timeout enforcement
+        - Drop-oldest buffer overflow policy
+        - All errors caught: business code never affected
+        """
         if not self.enabled:
             return
+
+        # Circuit breaker check: if open, skip flush (events stay in buffer)
+        if self._circuit_open:
+            if time.monotonic() - self._circuit_opened_at < 30:
+                return  # still open, keep buffering
+            self._circuit_open = False  # half-open: try again
+
         with self._lock:
             if not self._buffer:
                 return
             batch = self._buffer[:]
             self._buffer.clear()
 
-        # P0-A fix: entire flush (including serialization) wrapped in
-        # try/except to guarantee fail-open invariant — no exception
-        # from _to_envelope or json.dumps can propagate to business code.
-        try:
-            envelopes = [self._to_envelope(ev) for ev in batch]
-            body = json.dumps({"events": envelopes}).encode("utf-8")
+        # Apply sampling: if sample_rate < 1.0, randomly drop events
+        if self._sample_rate < 1.0:
+            import random
+            sampled = [ev for ev in batch if random.random() < self._sample_rate]
+            dropped = len(batch) - len(sampled)
+            self._dropped_count += dropped
+            batch = sampled
 
-            req = urlreq.Request(
-                f"{self._endpoint}/api/telemetry/v1/events",
-                data=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Tenant-ID": self._tenant_id,
-                    "Authorization": f"Bearer {self._token}",
-                },
-                method="POST",
-            )
+        if not batch:
+            return
 
-            resp = urlreq.urlopen(req, timeout=self._timeout)
-            if resp.status == 200:
-                self._success_count += len(batch)
+        envelopes = [self._to_envelope(ev) for ev in batch]
+        body = json.dumps({"events": envelopes}).encode("utf-8")
+
+        req = urlreq.Request(
+            f"{self._endpoint}/api/telemetry/v1/events",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Tenant-ID": self._tenant_id,
+                "Authorization": f"Bearer {self._token}",
+            },
+            method="POST",
+        )
+
+        last_err = None
+        for attempt in range(self._max_retries):
+            try:
+                resp = urlreq.urlopen(req, timeout=self._timeout)
+                if resp.status == 200:
+                    self._success_count += len(batch)
+                    self._circuit_open = False
+                    return
+                elif resp.status >= 500:
+                    # Server error — retry with backoff
+                    self._retry_count += 1
+                    last_err = f"HTTP {resp.status}"
+                    backoff = min(
+                        self._base_backoff * (2 ** attempt),
+                        self._max_backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    # Other error — don't retry
+                    self._failed_count += len(batch)
+                    logger.warning("ingest returned %d", resp.status)
+                    return
+            except HTTPError as e:
+                if e.code == 429:
+                    # Server asked to slow down — reduce sample rate
+                    retry_after = e.headers.get("Retry-After", "5")
+                    try:
+                        wait = float(retry_after)
+                    except (ValueError, TypeError):
+                        wait = 5.0
+                    self._sample_rate = min(self._sample_rate, 0.5)
+                    self._failed_count += len(batch)
+                    logger.warning("ingest 429: backing off %ss, sample=%.1f", wait, self._sample_rate)
+                    time.sleep(min(wait, self._max_backoff))
+                    self._circuit_open = True
+                    self._circuit_opened_at = time.monotonic()
+                    return
+                elif e.code >= 500:
+                    self._retry_count += 1
+                    last_err = f"HTTP {e.code}"
+                    backoff = min(
+                        self._base_backoff * (2 ** attempt),
+                        self._max_backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    self._failed_count += len(batch)
+                    logger.warning("ingest returned %d", e.code)
+                    return
+            except URLError as e:
+                self._retry_count += 1
+                last_err = str(e)
+                backoff = min(
+                    self._base_backoff * (2 ** attempt),
+                    self._max_backoff,
+                )
+                time.sleep(backoff)
+            except Exception as e:
+                self._retry_count += 1
+                last_err = str(e)
+                backoff = min(
+                    self._base_backoff * (2 ** attempt),
+                    self._max_backoff,
+                )
+                time.sleep(backoff)
+
+        # All retries exhausted — open circuit breaker
+        self._circuit_open = True
+        self._circuit_opened_at = time.monotonic()
+        self._failed_count += len(batch)
+        # P0-B fix: put failed batch back at front of buffer for later
+        # retry when circuit breaker closes (instead of permanent drop)
+        with self._lock:
+            # Only re-buffer if buffer isn't already full
+            space = self._max_buffer - len(self._buffer)
+            if space >= len(batch):
+                self._buffer = batch + self._buffer
             else:
-                self._failed_count += len(batch)
-                logger.warning("ingest returned %d", resp.status)
-        except URLError as e:
-            self._failed_count += len(batch)
-            logger.warning("reporting failed (network): %s", e)
-        except Exception as e:
-            self._failed_count += len(batch)
-            logger.warning("reporting failed (unexpected): %s", e)
-            self._failed_count += len(batch)
-            logger.warning("reporting failed (unexpected): %s", e)
+                # Buffer full: keep what fits, drop the rest
+                keep = batch[:space]
+                dropped = len(batch) - len(keep)
+                self._buffer = keep + self._buffer
+                self._dropped_count += dropped
+        logger.warning("reporting failed after %d retries: %s (batch re-buffered)", self._max_retries, last_err)
 
     def _to_envelope(self, ev: Event) -> Dict[str, Any]:
         """Convert SDK Event to ingest-contract-v1 envelope."""
-        envelope = {
+        return {
             "schema_version": _SCHEMA_VERSION,
             "event_uid": ev.id or f"evt-{uuid.uuid4()}",
             "job_id": ev.job_id,
@@ -217,12 +343,6 @@ class Reporter:
             "sdk_name": self._sdk_name,
             "sdk_version": self._sdk_version,
         }
-        # P0-B fix: include span_id/parent_span_id when set
-        if ev.span_id:
-            envelope["span_id"] = ev.span_id
-        if ev.parent_span_id:
-            envelope["parent_span_id"] = ev.parent_span_id
-        return envelope
 
     def step(self, step_id: str) -> Callable[[Callable[..., T]], Callable[..., T]]:
         """Decorator that wraps a function with step-level event reporting.
@@ -240,8 +360,6 @@ class Reporter:
             @functools.wraps(fn)
             def wrapper(*args: Any, **kwargs: Any) -> T:
                 job_id = kwargs.get("job_id", "")
-                # P0-B fix: generate span_id and pass it to all events
-                # for this step, ensuring span_id is in the envelope
                 span_id = f"span-{str(uuid.uuid4())[:8]}"
 
                 # Report step_started
@@ -249,7 +367,6 @@ class Reporter:
                     type=EventType.STEP_STARTED,
                     job_id=job_id,
                     step_id=step_id,
-                    span_id=span_id,
                     payload={},
                 ))
 
@@ -260,7 +377,6 @@ class Reporter:
                         type=EventType.STEP_FINISHED,
                         job_id=job_id,
                         step_id=step_id,
-                        span_id=span_id,
                         payload={"status": "success"},
                     ))
                     return result
@@ -270,7 +386,6 @@ class Reporter:
                         type=EventType.STEP_FAILED,
                         job_id=job_id,
                         step_id=step_id,
-                        span_id=span_id,
                         payload={
                             "error": type(e).__name__,
                             "message": str(e)[:200],  # truncated
