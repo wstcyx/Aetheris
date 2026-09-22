@@ -23,6 +23,7 @@ from .types import Job, JobState, Step, Event, EventType, Checkpoint
 from .store import Store, MemoryStore
 from .runner import Runner
 from .idempotent import IdempotentTool
+from .reporting import Reporter
 
 __all__ = [
     "Job",
@@ -35,6 +36,7 @@ __all__ = [
     "MemoryStore",
     "Runner",
     "IdempotentTool",
+    "Reporter",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
