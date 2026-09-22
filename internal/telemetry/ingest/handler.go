@@ -24,9 +24,8 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +35,15 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
 )
+
+// JobOwnershipChecker verifies that a job_id belongs to a tenant.
+// Implemented by agent/job.JobStore.Get (returns job with TenantID).
+// This interface avoids a direct dependency on internal/agent/job.
+type JobOwnershipChecker interface {
+	// CheckJobOwnership returns the tenant_id of the job, or empty
+	// string if the job doesn't exist or belongs to a different tenant.
+	CheckJobOwnership(ctx context.Context, jobID, tenantID string) bool
+}
 
 const (
 	// maxBatchSize is the maximum number of events per batch request.
@@ -96,6 +104,8 @@ type Handler struct {
 	// this in-memory map is for single-instance use.
 	dedup       map[string]bool
 	rateLimiter *rateLimiter
+	// ownershipChecker verifies job_id belongs to the tenant (P0-A fix)
+	ownershipChecker JobOwnershipChecker
 }
 
 // NewHandler creates an ingest handler. The store should be a
@@ -106,6 +116,12 @@ func NewHandler(store jobstore.JobStore) *Handler {
 		dedup:       make(map[string]bool),
 		rateLimiter: newRateLimiter(rateLimitWindow, rateLimitMaxRequests),
 	}
+}
+
+// SetOwnershipChecker sets the job ownership checker (P0-A fix).
+// Without this, cross-tenant job_id writes are not blocked.
+func (h *Handler) SetOwnershipChecker(checker JobOwnershipChecker) {
+	h.ownershipChecker = checker
 }
 
 // IngestEvents handles POST /api/telemetry/v1/events.
@@ -204,6 +220,13 @@ func (h *Handler) processEvent(ctx context.Context, tenantID string, ev EventEnv
 		return eventOutcome{"rejected", "tenant_mismatch"}
 	}
 
+	// P0-A: Verify job ownership — job_id must belong to this tenant
+	if h.ownershipChecker != nil {
+		if !h.ownershipChecker.CheckJobOwnership(ctx, ev.JobID, tenantID) {
+			return eventOutcome{"rejected", "job_not_owned"}
+		}
+	}
+
 	// Validate job_id format
 	if !isValidJobID(ev.JobID) {
 		return eventOutcome{"rejected", "invalid_job_id"}
@@ -230,13 +253,20 @@ func (h *Handler) processEvent(ctx context.Context, tenantID string, ev EventEnv
 		return eventOutcome{"rejected", "future_timestamp"}
 	}
 
-	// Dedup check: (tenant, job_id, event_uid)
+	// Dedup check: (tenant, job_id, event_uid) — P1-A fix: hold lock
+	// through check+mark to prevent TOCTOU race
 	dedupKey := fmt.Sprintf("%s:%s:%s", tenantID, ev.JobID, ev.EventUID)
 	h.mu.Lock()
 	if h.dedup[dedupKey] {
 		h.mu.Unlock()
 		return eventOutcome{"deduped", ""}
 	}
+	// P1-A fix: mark as seen NOW (before Append) to prevent concurrent
+	// duplicates from passing the check. If Append fails, we leave the
+	// mark (duplicate retry will dedup, which is safe — the event just
+	// didn't land, but a retry will get deduped; acceptable trade-off
+	// vs the alternative of allowing duplicates).
+	h.dedup[dedupKey] = true
 	h.mu.Unlock()
 
 	// Build JobEvent
@@ -250,29 +280,38 @@ func (h *Handler) processEvent(ctx context.Context, tenantID string, ev EventEnv
 		je.Payload = []byte(`{}`)
 	}
 
-	// Get current version for the job
-	_, version, err := h.store.ListEvents(ctx, ev.JobID)
+	// P0-C: Check if job is in terminal state
+	events, version, err := h.store.ListEvents(ctx, ev.JobID)
 	if err != nil {
 		return eventOutcome{"rejected", "store_error"}
 	}
-
-	// Append through RedactingStore (redaction happens here)
-	_, err = h.store.Append(ctx, ev.JobID, version, je)
-	if err != nil {
-		// Version mismatch = concurrent append; retry once
-		_, version, _ = h.store.ListEvents(ctx, ev.JobID)
-		_, err = h.store.Append(ctx, ev.JobID, version, je)
-		if err != nil {
-			return eventOutcome{"rejected", "append_failed"}
-		}
+	if isJobTerminal(events) {
+		return eventOutcome{"rejected", "job_terminal"}
 	}
 
-	// Mark as deduped
-	h.mu.Lock()
-	h.dedup[dedupKey] = true
-	h.mu.Unlock()
-
-	return eventOutcome{"accepted", ""}
+	// P0-B: Multi-round retry for version conflicts (up to 10 rounds)
+	// P2-A: Only retry on ErrVersionMismatch, not on other errors
+	maxRetries := 10
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		_, err = h.store.Append(ctx, ev.JobID, version, je)
+		if err == nil {
+			return eventOutcome{"accepted", ""}
+		}
+		if !errors.Is(err, jobstore.ErrVersionMismatch) {
+			// Non-retryable error (store failure, redaction failure)
+			return eventOutcome{"rejected", "append_failed"}
+		}
+		// Version mismatch: re-read version and retry
+		_, version, err = h.store.ListEvents(ctx, ev.JobID)
+		if err != nil {
+			return eventOutcome{"rejected", "store_error"}
+		}
+		// Small jitter to reduce contention
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * time.Millisecond)
+		}
+	}
+	return eventOutcome{"rejected", "append_failed"}
 }
 
 // isValidJobID checks the job_id format per ingest-contract-v1 §2.2.
@@ -291,11 +330,28 @@ func isValidJobID(id string) bool {
 
 // isReportableType checks if the event type is in the reportable set
 // per ingest-contract-v1 §3.1 (checkpoint_loaded is NOT reportable).
+// P1-B fix: added decision_snapshot, reasoning_snapshot.
 func isReportableType(t string) bool {
 	switch t {
 	case "job_created", "job_started", "job_completed", "job_failed",
 		"job_cancelled", "step_started", "step_finished", "step_failed",
-		"step_retried", "step_skipped", "checkpoint_saved", "effect_recorded":
+		"step_retried", "step_skipped", "checkpoint_saved", "effect_recorded",
+		"decision_snapshot", "reasoning_snapshot":
+		return true
+	default:
+		return false
+	}
+}
+
+// isJobTerminal checks if the job's latest event is a terminal state
+// (P0-C fix: terminal jobs must not accept business events).
+func isJobTerminal(events []jobstore.JobEvent) bool {
+	if len(events) == 0 {
+		return false
+	}
+	last := events[len(events)-1]
+	switch last.Type {
+	case jobstore.JobCompleted, jobstore.JobFailed, jobstore.JobCancelled:
 		return true
 	default:
 		return false
@@ -359,7 +415,3 @@ func (h *Handler) HealthCheck(ctx context.Context) error {
 	}
 	return nil
 }
-
-// ensure not empty import
-var _ = strings.TrimSpace
-var _ = http.StatusOK
