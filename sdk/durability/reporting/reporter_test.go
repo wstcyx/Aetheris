@@ -110,8 +110,12 @@ func TestReporter_429CircuitOpen(t *testing.T) {
 	}
 
 	r.Report("job-1", "step_started", map[string]any{})
+	r.Flush() // sync flush since Report no longer flushes synchronously
 
-	if !r.circuitOpen {
+	r.mu.Lock()
+	open := r.circuitOpen
+	r.mu.Unlock()
+	if !open {
 		t.Error("circuit should be open after 429")
 	}
 	_, _, failed := r.Stats()
@@ -167,6 +171,7 @@ func TestReporter_TokenNotInPayload(t *testing.T) {
 	}
 
 	r.Report("job-1", "step_started", map[string]any{"data": "test"})
+	r.Flush() // sync flush to trigger request
 
 	if strings.Contains(string(capturedBody), "SUPER_SECRET_TOKEN_12345") {
 		t.Error("token leaked into request body!")
