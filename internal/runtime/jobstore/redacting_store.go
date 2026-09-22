@@ -144,16 +144,18 @@ func (r *RedactingStore) CreateSnapshot(ctx context.Context, jobID string, upToV
 // redactSnapshot applies redaction to snapshot bytes (P1-A fix).
 // Snapshot is a serialized event stream state; we redact it as a
 // generic JSON blob using the global rules.
-func (r *RedactingStore) redactSnapshot(snapshot []byte) ([]byte, error) {
+func (r *RedactingStore) redactSnapshot(snapshot []byte) (out []byte, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			// fail-closed: return error, don't write unredacted snapshot
+			out = nil
+			err = fmt.Errorf("%w: panic in snapshot redaction: %v", ErrRedactionFailed, rec)
 		}
 	}()
 	// Apply global redaction rules to snapshot (treat as "snapshot" type)
-	redacted, err := r.engine.RedactData("snapshot", snapshot)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot redaction failed: %w", err)
+	redacted, e := r.engine.RedactData("snapshot", snapshot)
+	if e != nil {
+		return nil, fmt.Errorf("snapshot redaction failed: %w", e)
 	}
 	return redacted, nil
 }
