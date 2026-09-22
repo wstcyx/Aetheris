@@ -64,9 +64,10 @@ import (
 	"github.com/Colin4k1024/Aetheris/v2/internal/runtime/session"
 	"github.com/Colin4k1024/Aetheris/v2/internal/splitter"
 	"github.com/Colin4k1024/Aetheris/v2/internal/storage/vector"
-	"github.com/Colin4k1024/Aetheris/v2/pkg/redaction"
+	telemetryingest "github.com/Colin4k1024/Aetheris/v2/internal/telemetry/ingest"
 	"github.com/Colin4k1024/Aetheris/v2/pkg/auth"
 	"github.com/Colin4k1024/Aetheris/v2/pkg/config"
+	"github.com/Colin4k1024/Aetheris/v2/pkg/redaction"
 )
 
 // otelProviderShutdown 用于优雅关闭时关闭 OpenTelemetry provider
@@ -445,11 +446,15 @@ func NewApp(bootstrap *app.Bootstrap) (*App, error) {
 		jobEventStore = jobstore.NewMemoryStore()
 	}
 
-	// #5: wrap jobEventStore with RedactingStore to ensure all write
-	// paths go through the redaction pipeline (fail-closed on PII).
-	// Uses DefaultRedactionPolicy; can be overridden via config later.
+	// #5: wrap jobEventStore with RedactingStore (fail-closed on PII)
 	redactionEngine := redaction.NewEngine(jobstore.DefaultRedactionPolicy(), nil)
 	jobEventStore = jobstore.NewRedactingStore(jobEventStore, redactionEngine)
+
+	// #4: create ingest handler with ownership checker
+	ingestHandler := telemetryingest.NewHandler(jobEventStore)
+	if jobStore != nil {
+		ingestHandler.SetOwnershipChecker(&jobOwnershipChecker{store: jobStore})
+	}
 
 	var invocationStore agentexec.ToolInvocationStore
 	if bootstrap.Config != nil && bootstrap.Config.JobStore.Type == "postgres" && bootstrap.Config.JobStore.DSN != "" {
@@ -1034,4 +1039,18 @@ func startGRPC(engine *eino.Engine, docService app.DocumentService, jobStore job
 		_ = srv.Serve(lis)
 	}()
 	return &grpcRun{srv: srv, lis: lis}, nil
+}
+
+// jobOwnershipChecker implements ingest.JobOwnershipChecker using
+// the agent/job.JobStore to verify job_id belongs to a tenant (#4 P0-A).
+type jobOwnershipChecker struct {
+	store job.JobStore
+}
+
+func (c *jobOwnershipChecker) CheckJobOwnership(ctx context.Context, jobID, tenantID string) bool {
+	j, err := c.store.Get(ctx, jobID)
+	if err != nil || j == nil {
+		return false
+	}
+	return j.TenantID == tenantID
 }
