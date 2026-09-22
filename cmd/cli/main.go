@@ -96,6 +96,14 @@ func main() {
 			os.Exit(1)
 		}
 		runReplay(args[0])
+	case "query":
+		runQuery(args)
+	case "chain":
+		if len(args) < 1 {
+			fmt.Fprintf(os.Stderr, "Usage: aetheris chain <job_id> [--depth N] [--json]\n")
+			os.Exit(1)
+		}
+		runChain(args)
 	case "monitor":
 		runMonitor(args)
 	case "migrate":
@@ -189,7 +197,10 @@ func printUsage() {
 	fmt.Println("  jobs <agent_id> - 列出该 Agent 的 Jobs（runtime-first 建议使用 job_id 进行后续操作）")
 	fmt.Println("  trace <job_id>  - 输出 Job 执行时间线，并打印 Trace 页面 URL")
 	fmt.Println("  workers         - 列出当前活跃 Worker（Postgres 模式）")
-	fmt.Println("  replay <job_id> - 输出 Job 事件流（重放用）")
+	fmt.Println("  replay <job_id> - 输出 Job 事件流（重放用，无副作用）")
+	fmt.Println("  query [--agent=] [--status=] [--start=] [--end=] [--limit=N] [--json] - 多维度检索 Job")
+	fmt.Println("  chain <job_id> [--depth N] [--json] - 跨 agent 调用链树")
+	fmt.Println("  verify-tier <job_id> - 输出 Job 实际档位与缺失保证 (#12)")
 	fmt.Println("  monitor [--watch] [--interval N] - 输出运行期可观测性摘要")
 	fmt.Println("  migrate <subcommand> - 迁移辅助命令（如 m1-sql、backfill-hashes）")
 	fmt.Println("  cancel <job_id> - 请求取消执行中的 Job")
