@@ -118,3 +118,28 @@ func TestDecisionSnapshot(t *testing.T) {
 		t.Errorf("expected DecisionSnapshot, got %s", event.Type)
 	}
 }
+
+// TestT1ReportingEventTypes covers the T1 SDK-reported EventType constants
+// added by Issue #3 (ingest-contract-v1). These are additive — existing
+// constants' values are unchanged.
+func TestT1ReportingEventTypes(t *testing.T) {
+	cases := []struct {
+		name     string
+		got      EventType
+		expected EventType
+	}{
+		{"JobStarted", JobStarted, EventType("job_started")},
+		{"StepSkipped", StepSkipped, EventType("step_skipped")},
+		{"EffectRecorded", EffectRecorded, EventType("effect_recorded")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.got == "" {
+				t.Error("EventType should not be empty")
+			}
+			if c.got != c.expected {
+				t.Errorf("expected %s, got %s", c.expected, c.got)
+			}
+		})
+	}
+}

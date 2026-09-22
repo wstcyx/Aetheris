@@ -1,0 +1,1 @@
+{"schema_version":"1","event_uid":"evt-001","job_id":"job-abc123","agent_id":"my-agent","tenant_id":"tenant-acme","occurred_at":"2026-09-21T12:34:56.789Z","type":"job_created","payload":{"name":"data-pipeline"},"sdk_name":"aetheris-durability-py","sdk_version":"0.2.0"}
