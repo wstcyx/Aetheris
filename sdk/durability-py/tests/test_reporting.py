@@ -50,6 +50,7 @@ def make_reporter(endpoint="http://127.0.0.1:0", agent_id="test-agent"):
         tenant_id="tenant-test",
         token="test-token",
         agent_id=agent_id,
+        flush_interval=0,  # sync mode for deterministic tests
     )
 
 
@@ -93,6 +94,7 @@ class TestReporterStepDecorator:
             token="test-token",
             agent_id="test-agent",
             timeout=0.5,
+            flush_interval=0,  # sync mode for deterministic test
         )
 
         @reporter.step("step1")
