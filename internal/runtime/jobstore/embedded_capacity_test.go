@@ -128,6 +128,7 @@ func TestEmbeddedStore_CrashRecovery_KillMidWrite(t *testing.T) {
 
 // TestEmbeddedStore_CorruptedFileRecovery verifies behavior when the
 // JSON file is corrupted (partial write without atomic rename).
+// P2 fix: added assertions — corrupted file must fail-closed.
 func TestEmbeddedStore_CorruptedFileRecovery(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "corrupt-test.json")
@@ -135,20 +136,73 @@ func TestEmbeddedStore_CorruptedFileRecovery(t *testing.T) {
 	// Write a corrupted JSON file directly
 	os.WriteFile(dbPath, []byte(`{"by_job": {"incomplete`), 0644)
 
-	// NewEmbeddedStore on corrupted file: current impl returns error
-	// (load fails on invalid JSON). This is fail-closed behavior —
-	// better to refuse to start than serve corrupted data.
 	store, err := NewEmbeddedStore(dbPath)
-	if store != nil {
-		// If it somehow recovered, should start empty
+	// P2 fix: corrupted file should NOT silently succeed
+	if err == nil && store != nil {
+		// If it somehow recovered, must start empty (no leaked data)
 		events, _, _ := store.ListEvents(context.Background(), "any-job")
 		if len(events) != 0 {
 			t.Errorf("corrupted store should start empty, got %d events", len(events))
 		}
+	} else if err != nil {
+		// Expected: fail-closed — refuse to start on corrupted file
+		t.Logf("correctly refused to start on corrupted file: %v", err)
+	} else if store == nil && err == nil {
+		t.Error("NewEmbeddedStore returned (nil, nil) — should return error on corruption")
 	}
-	// err is expected for corrupted file — this is fail-closed
-	if err == nil && store == nil {
-		t.Log("NewEmbeddedStore returned (nil, nil) for corrupted file — acceptable (empty start)")
+}
+
+// BenchmarkEmbeddedStore_Append measures append latency as event count
+// grows (P1 fix: proper benchmark, not t.Logf).
+func BenchmarkEmbeddedStore_Append(b *testing.B) {
+	tmpDir := b.TempDir()
+	dbPath := filepath.Join(tmpDir, "bench-test.json")
+	store, _ := NewEmbeddedStore(dbPath)
+	ctx := context.Background()
+
+	// Pre-create job
+	store.Append(ctx, "job-bench", 0, JobEvent{
+		JobID: "job-bench", Type: JobCreated, Payload: []byte(`{}`), CreatedAt: time.Now(),
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := store.Append(ctx, "job-bench", i+1, JobEvent{
+			JobID: "job-bench",
+			Type:  StepStarted,
+			Payload: []byte(`{"step_id":"bench-step","input":"test-data"}`),
+			CreatedAt: time.Now(),
+		})
+		if err != nil {
+			b.Fatalf("Append %d failed: %v", i, err)
+		}
+	}
+}
+
+// BenchmarkEmbeddedStore_AppendLargePayload measures append with 1KB payload.
+func BenchmarkEmbeddedStore_AppendLargePayload(b *testing.B) {
+	tmpDir := b.TempDir()
+	dbPath := filepath.Join(tmpDir, "bench-large.json")
+	store, _ := NewEmbeddedStore(dbPath)
+	ctx := context.Background()
+
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = 'x'
+	}
+
+	store.Append(ctx, "job-large", 0, JobEvent{
+		JobID: "job-large", Type: JobCreated, Payload: []byte(`{}`), CreatedAt: time.Now(),
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := store.Append(ctx, "job-large", i+1, JobEvent{
+			JobID: "job-large", Type: StepStarted, Payload: payload, CreatedAt: time.Now(),
+		})
+		if err != nil {
+			b.Fatalf("Append %d failed: %v", i, err)
+		}
 	}
 }
 
