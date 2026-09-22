@@ -398,6 +398,9 @@ func (s *JobStorePg) ListByTenant(ctx context.Context, tenantID string, agentIDs
 		argIdx++
 	}
 
+	// ORDER BY must come before LIMIT (P0-A fix: was reversed, PG syntax error)
+	query += ` ORDER BY created_at DESC`
+
 	// Limit (cursor pagination support)
 	if limit > 0 {
 		query += fmt.Sprintf(` LIMIT $%d`, argIdx)
@@ -405,7 +408,6 @@ func (s *JobStorePg) ListByTenant(ctx context.Context, tenantID string, agentIDs
 		argIdx++
 	}
 
-	query += ` ORDER BY created_at DESC`
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err

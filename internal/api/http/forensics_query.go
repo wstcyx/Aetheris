@@ -93,9 +93,21 @@ func (h *Handler) ForensicsQuery(c context.Context, ctx *app.RequestContext) {
 
 	// Cursor pagination (stable across concurrent writes, #8)
 	// Cursor is the last job's CreatedAt (RFC3339) + ":" + job ID.
-	// Empty cursor = first page. The cursor is consumed by ListByTenant
-	// via the limit+1 pattern (request one extra to detect hasMore).
-	_ = strings.TrimSpace(req.Cursor)
+	// Empty cursor = first page. Cursor is consumed by setting it as
+	// timeRange.End upper bound (jobs before the cursor position).
+	cursor := strings.TrimSpace(req.Cursor)
+	if cursor != "" {
+		// Parse cursor: "RFC3339Nano:jobID"
+		parts := strings.SplitN(cursor, ":", 2)
+		if len(parts) == 2 {
+			if cursorTime, err := time.Parse(time.RFC3339Nano, parts[0]); err == nil {
+				// Set timeRange.End to cursor time to get jobs before cursor
+				if req.TimeRange.End.IsZero() || req.TimeRange.End.After(cursorTime) {
+					req.TimeRange.End = cursorTime
+				}
+			}
+		}
+	}
 
 	statusFilter := make(map[string]struct{}, len(req.StatusFilter))
 	for _, s := range req.StatusFilter {
