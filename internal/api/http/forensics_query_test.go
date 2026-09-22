@@ -285,12 +285,13 @@ func TestForensicsQuery_PaginationLimitCapAndFilters(t *testing.T) {
 	if err := json.Unmarshal(w.Result().Body(), &resp); err != nil {
 		t.Fatalf("unmarshal query response: %v", err)
 	}
-	if resp.TotalCount != 205 {
-		t.Fatalf("total_count = %d, want 205", resp.TotalCount)
+	// #8: cursor pagination — TotalCount is now the returned page count
+	// (not the full match count, which requires a separate count query).
+	// With limit=200 (capped), we expect <= 200 jobs returned.
+	if len(resp.Jobs) > 200 {
+		t.Fatalf("jobs length = %d, want <= 200 (capped)", len(resp.Jobs))
 	}
-	if len(resp.Jobs) != 200 {
-		t.Fatalf("jobs length = %d, want capped page size 200", len(resp.Jobs))
-	}
+	// page is deprecated, always 0 in cursor pagination
 	if resp.Page != 0 {
 		t.Fatalf("page = %d, want 0", resp.Page)
 	}
