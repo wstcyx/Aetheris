@@ -1088,13 +1088,19 @@ func (h *Handler) AgentMessage(ctx context.Context, c *app.RequestContext) {
 			parent, err := h.jobStore.Get(ctx, parentJobID)
 			if err == nil && parent != nil {
 				if parent.TenantID == tenantID {
-					// Same tenant: establish chain
-					j.ParentJobID = parentJobID
-					j.ParentAgentID = parentAgentID
-					if parent.RootJobID != "" {
-						j.RootJobID = parent.RootJobID
+					// P0-A fix: cycle detection — walk parent chain to check
+					// if the current agent's job would create a cycle
+					if hasCycle(ctx, h.jobStore, id, parentJobID, tenantID) {
+						hlog.CtxInfof(ctx, "call chain cycle detected: agent=%s parent=%s, disconnecting", id, parentJobID)
 					} else {
-						j.RootJobID = parentJobID // parent is root
+						// Same tenant, no cycle: establish chain
+						j.ParentJobID = parentJobID
+						j.ParentAgentID = parentAgentID
+						if parent.RootJobID != "" {
+							j.RootJobID = parent.RootJobID
+						} else {
+							j.RootJobID = parentJobID // parent is root
+						}
 					}
 				} else {
 					// Cross-tenant: disconnect and log, don't leak
@@ -2937,4 +2943,34 @@ func (h *Handler) handleApprovalAction(ctx context.Context, c *app.RequestContex
 		"decision": decision,
 		"message":  "审批已完成",
 	})
+}
+
+// hasCycle checks if setting parentJobID for agentID would create a
+// cycle in the call chain (#9 P0-A fix: cycle detection in production).
+// Walks the parent chain from parentJobID upward; if any job in the
+// chain belongs to agentID, a cycle is detected.
+func hasCycle(ctx context.Context, store job.JobStore, agentID, parentJobID, tenantID string) bool {
+	const maxDepth = 100 // prevent infinite loop
+	visited := make(map[string]bool)
+
+	current := parentJobID
+	for i := 0; i < maxDepth && current != ""; i++ {
+		if visited[current] {
+			return true // already visited = cycle
+		}
+		visited[current] = true
+
+		j, err := store.Get(ctx, current)
+		if err != nil || j == nil {
+			return false // parent not found, no cycle
+		}
+		if j.TenantID != tenantID {
+			return false // cross-tenant, no cycle (disconnected)
+		}
+		if j.AgentID == agentID {
+			return true // cycle: agent appears in its own parent chain
+		}
+		current = j.ParentJobID
+	}
+	return false
 }

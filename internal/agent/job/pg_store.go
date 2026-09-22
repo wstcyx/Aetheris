@@ -146,6 +146,23 @@ func pgToCaps(s *string) []string {
 	return out
 }
 
+// MigrateSchema adds columns needed by #9 (causal chaining).
+// Uses IF NOT EXISTS for idempotent runs on existing databases.
+func (s *JobStorePg) MigrateSchema(ctx context.Context) error {
+	stmts := []string{
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_job_id TEXT DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS root_job_id TEXT DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_agent_id TEXT DEFAULT ''`,
+		`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS parent_span_id TEXT DEFAULT ''`,
+	}
+	for _, stmt := range stmts {
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("migration failed (%s): %w", stmt, err)
+		}
+	}
+	return nil
+}
+
 func (s *JobStorePg) Create(ctx context.Context, j *Job) (string, error) {
 	if j == nil {
 		return "", errors.New("job is nil")
@@ -166,9 +183,10 @@ func (s *JobStorePg) Create(ctx context.Context, j *Job) (string, error) {
 		tenantID = "default"
 	}
 	_, err := s.pool.Exec(ctx,
-		`INSERT INTO jobs (id, agent_id, tenant_id, goal, status, cursor, retry_count, session_id, cancel_requested_at, created_at, updated_at, idempotency_key, required_capabilities)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		id, j.AgentID, nullStr(tenantID), j.Goal, statusToPg(StatusPending), j.Cursor, j.RetryCount, nullStr(j.SessionID), nullTime(j.CancelRequestedAt), j.CreatedAt, j.UpdatedAt, nullStr(j.IdempotencyKey), capsToPg(j.RequiredCapabilities))
+		`INSERT INTO jobs (id, agent_id, tenant_id, goal, status, cursor, retry_count, session_id, cancel_requested_at, created_at, updated_at, idempotency_key, required_capabilities, parent_job_id, root_job_id, parent_agent_id, parent_span_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+		id, j.AgentID, nullStr(tenantID), j.Goal, statusToPg(StatusPending), j.Cursor, j.RetryCount, nullStr(j.SessionID), nullTime(j.CancelRequestedAt), j.CreatedAt, j.UpdatedAt, nullStr(j.IdempotencyKey), capsToPg(j.RequiredCapabilities),
+		nullStr(j.ParentJobID), nullStr(j.RootJobID), nullStr(j.ParentAgentID), nullStr(j.ParentSpanID))
 	if err != nil {
 		return "", err
 	}
@@ -179,12 +197,13 @@ func (s *JobStorePg) Get(ctx context.Context, jobID string) (*Job, error) {
 	var j Job
 	var status int
 	var cursor, sessionID, idempotencyKey, requiredCaps, tenantID *string
+	var parentJobID, rootJobID, parentAgentID, parentSpanID *string
 	var retryCount int
 	var cancelRequestedAt *time.Time
 	var createdAt, updatedAt time.Time
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, agent_id, COALESCE(tenant_id, 'default'), goal, status, cursor, retry_count, session_id, cancel_requested_at, created_at, updated_at, idempotency_key, required_capabilities FROM jobs WHERE id = $1`,
-		jobID).Scan(&j.ID, &j.AgentID, &tenantID, &j.Goal, &status, &cursor, &retryCount, &sessionID, &cancelRequestedAt, &createdAt, &updatedAt, &idempotencyKey, &requiredCaps)
+		`SELECT id, agent_id, COALESCE(tenant_id, 'default'), goal, status, cursor, retry_count, session_id, cancel_requested_at, created_at, updated_at, idempotency_key, required_capabilities, parent_job_id, root_job_id, parent_agent_id, parent_span_id FROM jobs WHERE id = $1`,
+		jobID).Scan(&j.ID, &j.AgentID, &tenantID, &j.Goal, &status, &cursor, &retryCount, &sessionID, &cancelRequestedAt, &createdAt, &updatedAt, &idempotencyKey, &requiredCaps, &parentJobID, &rootJobID, &parentAgentID, &parentSpanID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -213,6 +232,19 @@ func (s *JobStorePg) Get(ctx context.Context, jobID string) (*Job, error) {
 		j.IdempotencyKey = *idempotencyKey
 	}
 	j.RequiredCapabilities = pgToCaps(requiredCaps)
+	// #9 P0-B fix: read parent/root job fields
+	if parentJobID != nil {
+		j.ParentJobID = *parentJobID
+	}
+	if rootJobID != nil {
+		j.RootJobID = *rootJobID
+	}
+	if parentAgentID != nil {
+		j.ParentAgentID = *parentAgentID
+	}
+	if parentSpanID != nil {
+		j.ParentSpanID = *parentSpanID
+	}
 	return &j, nil
 }
 
