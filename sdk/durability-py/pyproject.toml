@@ -1,10 +1,10 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "aetheris-durability"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone durability SDK for AI agents — crash recovery, checkpointing, idempotency. Zero framework dependency."
 readme = "README.md"
 license = { text = "Apache-2.0" }

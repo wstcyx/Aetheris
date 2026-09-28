@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"time"
@@ -161,9 +162,22 @@ func (s *pgStore) Append(ctx context.Context, jobID string, expectedVersion int,
 	// 2.0-M1: 计算当前事件的 hash
 	eventHash := computeEventHash(jobID, event.Type, payload, event.CreatedAt, prevHash)
 
+	// PG 10.x JSONB rejects invalid Unicode escapes (e.g. \u0000).
+	// Re-encode payload through json.Marshal to get clean UTF-8.
+	cleanPayload := payload
+	if len(cleanPayload) > 0 {
+		var raw interface{}
+		if err := json.Unmarshal(cleanPayload, &raw); err == nil {
+			cleanBytes, err := json.Marshal(raw)
+			if err == nil {
+				cleanPayload = cleanBytes
+			}
+		}
+	}
+
 	_, err = s.pool.Exec(ctx,
 		`INSERT INTO job_events (job_id, version, type, payload, created_at, prev_hash, hash) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		jobID, newVersion, string(event.Type), payload, event.CreatedAt, prevHash, eventHash)
+		jobID, newVersion, string(event.Type), cleanPayload, event.CreatedAt, prevHash, eventHash)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return 0, ErrVersionMismatch

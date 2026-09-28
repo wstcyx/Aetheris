@@ -179,28 +179,29 @@ class Reporter:
         """Buffer an event for reporting. Non-blocking, fail-open."""
         if not self.enabled:
             return
+        # 同步模式：直接发送单个事件，不走 buffer
+        if self._flush_interval == 0:
+            self._send_with_retry([event])
+            return
+        # 异步模式：buffer 后由后台线程 flush
         with self._lock:
             if len(self._buffer) >= self._max_buffer:
-                # Buffer full: drop oldest (per #7 discard-old policy)
                 self._buffer.pop(0)
                 self._dropped_count += 1
             self._buffer.append(event)
-        # P0-A fix: no immediate flush in background mode.
-        # In sync mode (flush_interval=0), flush immediately for tests.
-        if self._flush_interval == 0:
-            self._flush()
+
+    def _flush_one(self) -> None:
+        """Send only the last buffered event (sync mode, avoids version conflicts)."""
+        if not self.enabled:
+            return
+        with self._lock:
+            if not self._buffer:
+                return
+            batch = [self._buffer.pop()]
+        self._send_with_retry(batch)
 
     def _flush(self) -> None:
-        """Send buffered events to ingest endpoint. Fail-open (#7).
-
-        Implements:
-        - Exponential backoff with jitter on retry
-        - 429 Retry-After respect + sample rate reduction
-        - Circuit breaker (open after N consecutive failures)
-        - Timeout enforcement
-        - Drop-oldest buffer overflow policy
-        - All errors caught: business code never affected
-        """
+        """Send buffered events to ingest endpoint. Fail-open (#7)."""
         if not self.enabled:
             return
 
@@ -216,17 +217,10 @@ class Reporter:
             batch = self._buffer[:]
             self._buffer.clear()
 
-        # Apply sampling: if sample_rate < 1.0, randomly drop events
-        if self._sample_rate < 1.0:
-            import random
-            sampled = [ev for ev in batch if random.random() < self._sample_rate]
-            dropped = len(batch) - len(sampled)
-            self._dropped_count += dropped
-            batch = sampled
+        self._send_with_retry(batch)
 
-        if not batch:
-            return
-
+    def _send_with_retry(self, batch: list) -> None:
+        """Send a batch of events with retry logic. Fail-open."""
         envelopes = [self._to_envelope(ev) for ev in batch]
         body = json.dumps({"events": envelopes}).encode("utf-8")
 
@@ -359,7 +353,12 @@ class Reporter:
         def decorator(fn: Callable[..., T]) -> Callable[..., T]:
             @functools.wraps(fn)
             def wrapper(*args: Any, **kwargs: Any) -> T:
+                # 从 kwargs 或 args[0]（state dict）里取 job_id
                 job_id = kwargs.get("job_id", "")
+                if not job_id and args:
+                    # 常见模式：第一个参数是 state dict，含 job_id
+                    if isinstance(args[0], dict):
+                        job_id = args[0].get("job_id", "")
                 span_id = f"span-{str(uuid.uuid4())[:8]}"
 
                 # Report step_started
@@ -367,17 +366,20 @@ class Reporter:
                     type=EventType.STEP_STARTED,
                     job_id=job_id,
                     step_id=step_id,
-                    payload={},
+                    span_id=span_id,
+                    payload={"input": str(args)[:500] if args else ""},
                 ))
 
                 try:
                     result = fn(*args, **kwargs)
-                    # Report step_finished
+                    # Report step_finished — 包含函数返回值（LLM 回答等）
+                    result_str = str(result)[:2000] if result else ""
                     self.report(Event(
                         type=EventType.STEP_FINISHED,
                         job_id=job_id,
                         step_id=step_id,
-                        payload={"status": "success"},
+                        span_id=span_id,
+                        payload={"status": "success", "output": result_str},
                     ))
                     return result
                 except Exception as e:

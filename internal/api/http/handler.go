@@ -2969,8 +2969,243 @@ func hasCycle(ctx context.Context, store job.JobStore, agentID, parentJobID, ten
 		}
 		if j.AgentID == agentID {
 			return true // cycle: agent appears in its own parent chain
-		}
-		current = j.ParentJobID
+	}
+	current = j.ParentJobID
 	}
 	return false
+}
+
+// IngestTelemetry handles POST /api/telemetry/v1/events — receives T1 SDK
+// event batches and appends to jobstore (through RedactingStore if configured).
+func (h *Handler) IngestTelemetry(c context.Context, ctx *app.RequestContext) {
+	if h.jobEventStore == nil {
+		ctx.JSON(consts.StatusServiceUnavailable, map[string]string{"error": "event store not configured"})
+		return
+	}
+
+	tenantID := auth.GetTenantID(c)
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	var req struct {
+		Events []struct {
+			SchemaVersion string          `json:"schema_version"`
+			EventUID      string          `json:"event_uid"`
+			JobID         string          `json:"job_id"`
+			AgentID       string          `json:"agent_id"`
+			TenantID      string          `json:"tenant_id"`
+			OccurredAt    string          `json:"occurred_at"`
+			Type          string          `json:"type"`
+			Payload       json.RawMessage `json:"payload"`
+			SDKName       string          `json:"sdk_name"`
+			SDKVersion    string          `json:"sdk_version"`
+		} `json:"events"`
+	}
+	if err := ctx.BindJSON(&req); err != nil {
+		ctx.JSON(consts.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if len(req.Events) == 0 {
+		ctx.JSON(consts.StatusBadRequest, map[string]string{"error": "empty batch"})
+		return
+	}
+	if len(req.Events) > 100 {
+		ctx.JSON(consts.StatusRequestEntityTooLarge, map[string]string{"error": "batch too large (max 100)"})
+		return
+	}
+
+	accepted, deduped, rejected := 0, 0, 0
+	rejections := []map[string]string{}
+	seen := make(map[string]bool)
+
+	for _, ev := range req.Events {
+		key := tenantID + ":" + ev.JobID + ":" + ev.EventUID
+		if seen[key] {
+			deduped++
+			continue
+		}
+		if ev.TenantID != tenantID {
+			rejected++
+			rejections = append(rejections, map[string]string{"event_uid": ev.EventUID, "reason": "tenant_mismatch"})
+			continue
+		}
+
+		// Parse occurred_at
+		occurredAt, err := time.Parse(time.RFC3339, ev.OccurredAt)
+		if err != nil {
+			rejected++
+			rejections = append(rejections, map[string]string{"event_uid": ev.EventUID, "reason": "invalid_timestamp"})
+			continue
+		}
+		if occurredAt.After(time.Now().Add(5 * time.Minute)) {
+			rejected++
+			rejections = append(rejections, map[string]string{"event_uid": ev.EventUID, "reason": "future_timestamp"})
+			continue
+		}
+
+		payload := []byte(ev.Payload)
+		if len(payload) == 0 {
+			payload = []byte(`{}`)
+		}
+
+		je := jobstore.JobEvent{
+			JobID:     ev.JobID,
+			Type:      jobstore.EventType(ev.Type),
+			Payload:   payload,
+			CreatedAt: time.Now(),
+		}
+
+		_, version, _ := h.jobEventStore.ListEvents(c, ev.JobID)
+		_, err = h.jobEventStore.Append(c, ev.JobID, version, je)
+		if err != nil {
+			// Retry once on version mismatch
+			_, version, _ = h.jobEventStore.ListEvents(c, ev.JobID)
+			_, err = h.jobEventStore.Append(c, ev.JobID, version, je)
+		}
+		if err != nil {
+			hlog.CtxErrorf(c, "telemetry append failed: job=%s type=%s version=%d err=%v", ev.JobID, ev.Type, version, err)
+			rejected++
+			rejections = append(rejections, map[string]string{"event_uid": ev.EventUID, "reason": "append_failed"})
+			continue
+		}
+		seen[key] = true
+		accepted++
+
+		// 如果是 job_created 且元数据库有配置，自动创建 job 元数据记录
+		// 这样 /api/jobs/:id/events 和 /api/forensics/query 就能查到
+		if ev.Type == "job_created" && h.jobStore != nil {
+			existing, _ := h.jobStore.Get(c, ev.JobID)
+			if existing == nil {
+				j := &job.Job{
+					ID:       ev.JobID,
+					AgentID:  ev.AgentID,
+					TenantID: tenantID,
+					Goal:     "SDK-reported job",
+					Status:   job.StatusRunning,
+				}
+				_, _ = h.jobStore.Create(c, j)
+			}
+		}
+		// job_completed/job_failed/job_cancelled 时更新元数据状态
+		if (ev.Type == "job_completed" || ev.Type == "job_failed" || ev.Type == "job_cancelled") && h.jobStore != nil {
+			j, _ := h.jobStore.Get(c, ev.JobID)
+			if j != nil {
+				switch ev.Type {
+				case "job_completed":
+					_ = h.jobStore.UpdateStatus(c, ev.JobID, job.StatusCompleted)
+				case "job_failed":
+					_ = h.jobStore.UpdateStatus(c, ev.JobID, job.StatusFailed)
+				case "job_cancelled":
+					_ = h.jobStore.UpdateStatus(c, ev.JobID, job.StatusCancelled)
+				}
+			}
+		}
+	}
+
+	ctx.JSON(consts.StatusOK, map[string]any{
+		"accepted_version": "1",
+		"accepted":          accepted,
+		"deduped":           deduped,
+		"rejected":          rejected,
+		"rejections":         rejections,
+	})
+}
+
+// GetTelemetryJobEvents handles GET /api/telemetry/v1/jobs/:id/events
+// Reads events directly from the event store (no job metadata required).
+func (h *Handler) GetTelemetryJobEvents(c context.Context, ctx *app.RequestContext) {
+	jobID := ctx.Param("id")
+	if jobID == "" {
+		ctx.JSON(consts.StatusBadRequest, map[string]string{"error": "job id required"})
+		return
+	}
+	if h.jobEventStore == nil {
+		ctx.JSON(consts.StatusServiceUnavailable, map[string]string{"error": "event store not configured"})
+		return
+	}
+
+	events, version, err := h.jobEventStore.ListEvents(c, jobID)
+	if err != nil {
+		ctx.JSON(consts.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("list events failed: %v", err)})
+		return
+	}
+
+	type eventOut struct {
+		Type      string          `json:"type"`
+		JobID     string          `json:"job_id"`
+		CreatedAt string          `json:"created_at"`
+		Version   int             `json:"version"`
+		Payload   json.RawMessage `json:"payload,omitempty"`
+	}
+	out := make([]eventOut, 0, len(events))
+	for i, ev := range events {
+		// 解码 payload（base64 → JSON）
+		payload := ev.Payload
+		if len(payload) == 0 {
+			payload = []byte(`{}`)
+		}
+		out = append(out, eventOut{
+			Type:      string(ev.Type),
+			JobID:     ev.JobID,
+			CreatedAt: ev.CreatedAt.Format(time.RFC3339),
+			Version:   i + 1,
+			Payload:   payload,
+		})
+	}
+
+	ctx.JSON(consts.StatusOK, map[string]any{
+		"job_id":  jobID,
+		"version": version,
+		"events":  out,
+	})
+}
+
+// ListTelemetryJobs handles GET /api/telemetry/v1/jobs
+// Lists all jobs known to the job metadata store.
+func (h *Handler) ListTelemetryJobs(c context.Context, ctx *app.RequestContext) {
+	if h.jobStore == nil {
+		ctx.JSON(consts.StatusServiceUnavailable, map[string]string{"error": "job store not configured"})
+		return
+	}
+
+	tenantID := auth.GetTenantID(c)
+	if tenantID == "" {
+		tenantID = "default"
+	}
+
+	// 支持按 agent_id 过滤：GET /api/telemetry/v1/jobs?agent_id=test-agent
+	agentFilter := strings.TrimSpace(string(ctx.Query("agent_id")))
+	var agentIDs []string
+	if agentFilter != "" {
+		agentIDs = []string{agentFilter}
+	}
+
+	jobs, err := h.jobStore.ListByTenant(c, tenantID, agentIDs, job.TimeRange{}, 100)
+	if err != nil {
+		ctx.JSON(consts.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("list jobs failed: %v", err)})
+		return
+	}
+
+	type jobOut struct {
+		ID        string `json:"job_id"`
+		AgentID   string `json:"agent_id"`
+		Status    string `json:"status"`
+		CreatedAt string `json:"created_at"`
+	}
+	out := make([]jobOut, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobOut{
+			ID:        j.ID,
+			AgentID:   j.AgentID,
+			Status:    j.Status.String(),
+			CreatedAt: j.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	ctx.JSON(consts.StatusOK, map[string]any{
+		"tenant_id": tenantID,
+		"total":     len(out),
+		"jobs":      out,
+	})
 }

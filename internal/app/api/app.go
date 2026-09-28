@@ -447,7 +447,11 @@ func NewApp(bootstrap *app.Bootstrap) (*App, error) {
 	}
 
 	// #5: wrap jobEventStore with RedactingStore (fail-closed on PII)
-	redactionEngine := redaction.NewEngine(jobstore.DefaultRedactionPolicy(), nil)
+	// In dev mode (no AETHERIS_REDACTION=enable env), skip redaction for visibility
+	var redactionEngine *redaction.Engine
+	if os.Getenv("AETHERIS_REDACTION") == "enable" {
+		redactionEngine = redaction.NewEngine(jobstore.DefaultRedactionPolicy(), nil)
+	}
 	jobEventStore = jobstore.NewRedactingStore(jobEventStore, redactionEngine)
 
 	// #4: create ingest handler with ownership checker

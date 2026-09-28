@@ -241,6 +241,14 @@ func (r *Router) Build(addr string, opts ...config.Option) *server.Hertz {
 		rbac.POST("/check", r.authChainWith(auth.PermissionJobView, r.handler.CheckPermission)...)
 	}
 
+	// Telemetry ingest endpoint (T1 SDK event reporting)
+	telemetry := api.Group("/telemetry")
+	{
+		telemetry.POST("/v1/events", r.handler.IngestTelemetry)
+		telemetry.GET("/v1/jobs/:id/events", r.handler.GetTelemetryJobEvents)
+		telemetry.GET("/v1/jobs", r.handler.ListTelemetryJobs)
+	}
+
 	// ACP callbacks from Hermes Agent (no auth — protected by shared secret via X-ACP-Secret header)
 	// acp := api.Group("/acp")
 	// {
